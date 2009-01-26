@@ -28,16 +28,6 @@ Func isTrue($value) ;; returns True if a generic variable is 1, true, on, or ok 
 	Return $result
 EndFunc
 
-Func kill($pid) ;; kill a process and its subprocesses via taskkill windows command.
-			    ;; If the process still exists, remove PAMPA dependency trying to close it
-	If ProcessExists($pid) Then
-		RunWait('taskkill /T /F /PID ' & $pid, @SystemDir, @SW_HIDE)
-		If ProcessExists($pid) Then
-			ProcessClose($pid)
-		EndIf
-	EndIf
-EndFunc
-
 Func path($str)
 	Return StringReplace(StringReplace($str, "/", "\"), "\\", "\")
 EndFunc
@@ -68,7 +58,6 @@ EndFunc
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 Func PAMPA_Apache() ;; create the string to launch Apache reading directives from PAMPA/config/pampa.ini file and launch it
-	Local $getoutSinceThereIsSomethingWrong = 0
 	Local $webport = IniRead($PAMPA_INI_FILE, 'Jaxer', 'webport', '')
 	Local $Listen = IniRead($PAMPA_INI_FILE, 'Apache', 'Listen', '')
 	Local $ServerName = IniRead($PAMPA_INI_FILE, 'Apache', 'ServerName', '')
@@ -136,8 +125,27 @@ Func PAMPA_Apache() ;; create the string to launch Apache reading directives fro
 	If $PAMPA_DEBUG Then
 		write('apache.bat', 'start /B ' & $apache)
 	EndIf
+	Local $list = ProcessList("httpd.exe")
+	Local $length = $list[0][0] + 2
+	Local $skip = 0
 	Global $PAMPA_APACHE_PORT = $Listen
 	Global $PAMPA_APACHE = Run($apache, @ScriptDir, @SW_HIDE)
+	While 1
+		$skip += 1
+		$list = ProcessList("httpd.exe")
+		If $list[0][0] = $length Then
+			ExitLoop
+		Else
+			If $skip == 25 Then
+				ExitLoop
+			Else
+				PAMPA_Sleep(200)
+			EndIf
+		EndIf
+	WEnd
+	If $PAMPA_NO_TASKKILL Then
+		Global $PAMPA_APACHE_SUBPROCESS = PAMPA_ApacheSubprocess($ErrorLog)
+	EndIf
 EndFunc
 
 Func PAMPA_Browser() ;; uses the default browser if X-Firefox is not present (ready for WinPenPack project)
@@ -154,21 +162,10 @@ Func PAMPA_Browser() ;; uses the default browser if X-Firefox is not present (re
 	If $PAMPA_DEBUG Then
 		write('browser.bat', $browser)
 	EndIf
-	While InetGetSize('http://127.0.0.1:' & $PAMPA_APACHE_PORT & '/') < 0
-		If @error <> 0 Or $getoutSinceThereIsSomethingWrong == 49 Then
-			$PAMPA_ERROR = True
-			TrayTip("Warning", "Please be sure the port " & $PAMPA_APACHE_PORT & " is not used and/or Apache has been authorized", 3, 2)
-			ExitLoop
-		EndIf
-		PAMPA_Sleep(200)
-		$getoutSinceThereIsSomethingWrong = $getoutSinceThereIsSomethingWrong + 1
-	WEnd
-	If $PAMPA_ERROR == False Then
-		If $PAMPA_BROWSER <> -1 Then
-			ProcessClose($PAMPA_BROWSER)
-		EndIf
-		$PAMPA_BROWSER = Run($browser, @ScriptDir, @SW_HIDE)
+	If $PAMPA_BROWSER <> -1 Then
+		ProcessClose($PAMPA_BROWSER)
 	EndIf
+	$PAMPA_BROWSER = Run($browser, @ScriptDir, @SW_HIDE)
 EndFunc
 
 Func PAMPA_Jaxer() ;; create the string to launch the Jaxer manager and Jaxer itself reading directives from PAMPA/config/pampa.ini file and launch them
@@ -276,11 +273,58 @@ Func PAMPA_About() ;; show the popup with PAMPA project informations
 	WEnd
 EndFunc
 
-Func PAMPA_Error() ;; deprecated -- in this file for possible future reuse
-	If @error <> 0 Then
-		$PAMPA_ERROR = True
-		TrayTip("Warning", "Something was wrong!", 3, 3)
+Func PAMPA_ApacheSubprocess($file) ;; using a couple of weird strategies figures out the second apache process. This fnction is used only with XP Home edition (no taskkill)
+	Local $pid = 0
+	Local $i = 1
+	Local $tries = 0
+	While FileExists($file) = False
+		$tries += 1
+		Sleep(100)
+		If $tries == 100 Then
+			$i = 0
+			ExitLoop
+		EndIf
+	WEnd
+	If $i == 1 Then
+		Local $array
+		Local $found = False
+		Local $list = ProcessList("httpd.exe")
+		Local $fp = FileOpen($file, 0)
+		While FileReadLine($fp, $i)
+			If @error = -1 Then
+				ExitLoop
+			Else
+				$i += 1
+			EndIf
+		WEnd
+		While 1 < $i
+			$i -= 1
+			$array = StringRegExp(FileReadLine($fp, $i), "(?i)\bchild\b.*?([0-9]+)", 2)
+			If UBound($array) == 2 Then
+				$pid = Int($array[1])
+				If $pid <> $PAMPA_APACHE And ProcessExists($pid) Then
+					for $j = 1 to $list[0][0]
+						If $list[$j][1] = $pid Then
+							$found = True
+							ExitLoop
+						EndIf
+					next
+					If $found Then
+						ExitLoop
+					EndIf
+				EndIf
+			EndIf
+		WEnd
+		FileClose($fp)
+		If $found == False Then
+			$pid = 0
+		EndIf
 	EndIf
+	If $PAMPA_DEBUG Then
+		write('apache.first.pid.txt', $PAMPA_APACHE)
+		write('apache.second.pid.txt', $pid)
+	EndIf
+	Return $pid
 EndFunc
 
 Func PAMPA_Exit() ;; remove temporary flder and files if removeTemporaryFilesOnExit directive is True and kill the process itself plus its subprocesses
@@ -289,12 +333,12 @@ Func PAMPA_Exit() ;; remove temporary flder and files if removeTemporaryFilesOnE
 		DirRemove($PAMPA_TMP, 1)
 	EndIf
 	TraySetState(2)
-	kill(@AutoItPID)
+	PAMPA_Kill(@AutoItPID)
 	Exit
 EndFunc
 
 Func PAMPA_Globals() ;; define global variables, with $PAMPA_ prefix, for the entire programm lifetime
-	Global $PAMPA_ERROR = False
+	Global $PAMPA_NO_TASKKILL = FileExists(@SystemDir & "\taskkill.exe") <> True
 	Global $PAMPA_BROWSER = -1
 	Global $PAMPA_PATH = path(@ScriptDir)
 	Global $PAMPA_INI_FILE = $PAMPA_PATH & '\PAMPA\config\pampa.ini'
@@ -315,6 +359,20 @@ Func PAMPA_Globals() ;; define global variables, with $PAMPA_ prefix, for the en
 	Global $PAMPA_APACHE_DOCUMENT_ROOT = IniRead($PAMPA_INI_FILE, 'Apache', 'DocumentRoot', '')
 	If $PAMPA_APACHE_DOCUMENT_ROOT == '' Then
 		$PAMPA_APACHE_DOCUMENT_ROOT = $PAMPA_PATH & '\PAMPA\apache.32\htdocs'
+	EndIf
+EndFunc
+
+Func PAMPA_Kill($pid) ;; kill a process and its subprocesses using taskkill, if present, or ProcessClose.
+	If ProcessExists($pid) Then
+		If $PAMPA_NO_TASKKILL Then
+			ProcessClose($pid)
+			Sleep(100)
+			If ProcessExists($pid) Then
+				Run('tskill ' & $pid & ' /A', @SystemDir, @SW_HIDE)
+			EndIf
+		Else
+			RunWait('taskkill /T /F /PID ' & $pid, @SystemDir, @SW_HIDE)
+		EndIf
 	EndIf
 EndFunc
 
@@ -402,30 +460,29 @@ Func PAMPA_Start() ;; verify which third part software should be launched and la
 	If $PAMPA_LAUNCH_MYSQL Then
 		PAMPA_MySQL()
 	EndIf
-	If $PAMPA_ERROR == False And $PAMPA_LAUNCH_JAXER Then
+	If $PAMPA_LAUNCH_JAXER Then
 		PAMPA_Jaxer()
 	EndIf
-	If $PAMPA_ERROR == False Then
-		PAMPA_Apache()
-	EndIf
-	If $PAMPA_ERROR == False And $PAMPA_LAUNCH_BROWSER Then
+	PAMPA_Apache()
+	If $PAMPA_LAUNCH_BROWSER Then
 		PAMPA_Browser()
 	EndIf
-	If $PAMPA_ERROR == False Then
-		PAMPA_TrayStatus("start")
-	EndIf
+	PAMPA_TrayStatus("start")
 	$PAMPA_AUTOSTART = True
 EndFunc
 
 Func PAMPA_Stop() ;; kill processes launched by PAMPA, if any. Remove dependencies from the launched browser (should not close it)
 	If $PAMPA_LAUNCH_MYSQL And $PAMPA_AUTOSTART Then
-		kill($PAMPA_MYSQL)
+		PAMPA_Kill($PAMPA_MYSQL)
 	EndIF
 	If $PAMPA_LAUNCH_JAXER And $PAMPA_AUTOSTART Then
-		kill($PAMPA_JAXER_MANAGER)
+		PAMPA_Kill($PAMPA_JAXER_MANAGER)
 	EndIf
 	If $PAMPA_AUTOSTART Then
-		kill($PAMPA_APACHE)
+		PAMPA_Kill($PAMPA_APACHE)
+		If $PAMPA_NO_TASKKILL Then
+			PAMPA_Kill($PAMPA_APACHE_SUBPROCESS)
+		EndIf
 	EndIf
 	If $PAMPA_LAUNCH_BROWSER And $PAMPA_AUTOSTART Then
 		ProcessClose($PAMPA_BROWSER)
